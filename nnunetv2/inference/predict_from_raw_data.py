@@ -19,6 +19,9 @@ from torch._dynamo import OptimizedModule
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
+import openvino as ov
+import openvino.properties.hint as hints
+
 import nnunetv2
 from nnunetv2.configuration import default_num_processes
 from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy, preprocessing_iterator_fromfiles, \
@@ -56,6 +59,9 @@ class nnUNetPredictor(object):
         self.tile_step_size = tile_step_size
         self.use_gaussian = use_gaussian
         self.use_mirroring = use_mirroring
+
+        self.use_openvino = True
+
         if device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
         else:
@@ -115,6 +121,7 @@ class nnUNetPredictor(object):
         self.list_of_parameters = parameters
 
         # initialize network with first set of parameters, also see https://github.com/MIC-DKFZ/nnUNet/issues/2520
+        # print("loads-state_dict para from: ", parameters[0])
         network.load_state_dict(parameters[0])
 
         self.network = network
@@ -123,10 +130,30 @@ class nnUNetPredictor(object):
         self.trainer_name = trainer_name
         self.allowed_mirroring_axes = inference_allowed_mirroring_axes
         self.label_manager = plans_manager.get_label_manager(dataset_json)
-        if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
-                and not isinstance(self.network, OptimizedModule):
-            print('Using torch.compile')
-            self.network = torch.compile(self.network)
+
+        ov_model_path = f"{model_training_output_dir}/model.xml"
+        config = {
+            hints.performance_mode: hints.PerformanceMode.LATENCY,
+            hints.enable_cpu_pinning(): True,
+        }
+        core = ov.Core()
+        core.set_property(
+            "CPU",
+            {hints.execution_mode: hints.ExecutionMode.PERFORMANCE},
+        )
+        if not os.path.exists(ov_model_path):
+            input_tensor = torch.randn(
+                1, num_input_channels, *configuration_manager.patch_size,
+                requires_grad=False
+            )
+            ov_model = ov.convert_model(
+                self.network, example_input=input_tensor
+                )
+            ov.save_model(ov_model, ov_model_path)
+
+        ov_model = core.read_model(ov_model_path)
+        self.network = core.compile_model(ov_model, "CPU", config=config)
+
 
     def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
                               configuration_manager: ConfigurationManager, parameters: Optional[List[dict]],
@@ -177,6 +204,7 @@ class nnUNetPredictor(object):
         list_of_lists_or_source_folder = list_of_lists_or_source_folder[part_id::num_parts]
         caseids = [os.path.basename(i[0])[:-(len(self.dataset_json['file_ending']) + 5)] for i in
                    list_of_lists_or_source_folder]
+        print("caseids: ", caseids)
         print(
             f'I am process {part_id} out of {num_parts} (max process ID is {num_parts - 1}, we start counting with 0!)')
         print(f'There are {len(caseids)} cases that I would like to predict')
@@ -483,31 +511,35 @@ class nnUNetPredictor(object):
         RETURNED LOGITS HAVE THE SHAPE OF THE INPUT. THEY MUST BE CONVERTED BACK TO THE ORIGINAL IMAGE SIZE.
         SEE convert_predicted_logits_to_segmentation_with_correct_shape
         """
-        n_threads = torch.get_num_threads()
-        torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
         prediction = None
 
-        for params in self.list_of_parameters:
+        if not self.use_openvino:
+            for params in self.list_of_parameters:
 
-            # messing with state dict names...
-            if not isinstance(self.network, OptimizedModule):
-                self.network.load_state_dict(params)
-            else:
-                self.network._orig_mod.load_state_dict(params)
+                # messing with state dict names...
+                if not isinstance(self.network, OptimizedModule):
+                    self.network.load_state_dict(params)
+                else:
+                    self.network._orig_mod.load_state_dict(params)
 
-            # why not leave prediction on device if perform_everything_on_device? Because this may cause the
-            # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
-            # this actually saves computation time
+                # why not leave prediction on device if perform_everything_on_device? Because this may cause the
+                # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
+                # this actually saves computation time
+                if prediction is None:
+                    prediction = self.predict_sliding_window_return_logits(data).to('cpu')
+                else:
+                    prediction += self.predict_sliding_window_return_logits(data).to('cpu')
+
+            if len(self.list_of_parameters) > 1:
+                prediction /= len(self.list_of_parameters)
+
+        else:
             if prediction is None:
-                prediction = self.predict_sliding_window_return_logits(data).to('cpu')
+                prediction = self.predict_sliding_window_return_logits(data)
             else:
-                prediction += self.predict_sliding_window_return_logits(data).to('cpu')
-
-        if len(self.list_of_parameters) > 1:
-            prediction /= len(self.list_of_parameters)
+                prediction += self.predict_sliding_window_return_logits(data)
 
         if self.verbose: print('Prediction done')
-        torch.set_num_threads(n_threads)
         return prediction
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
@@ -547,11 +579,12 @@ class nnUNetPredictor(object):
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
-        prediction = self.network(x)
+        if self.use_openvino:
+            prediction = torch.from_numpy(self.network(x)[0])
+        else:
+            prediction = self.network(x)
 
         if mirror_axes is not None:
-            # check for invalid numbers in mirror_axes
-            # x should be 5d for 3d images and 4d for 2d. so the max value of mirror_axes cannot exceed len(x.shape) - 3
             assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes does not match the dimension of the input!'
 
             mirror_axes = [m + 2 for m in mirror_axes]
@@ -559,7 +592,12 @@ class nnUNetPredictor(object):
                 c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
             ]
             for axes in axes_combinations:
-                prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
+                if not self.use_openvino:
+                    prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
+                else:
+                    temp_pred = torch.from_numpy(self.network(torch.flip(x, axes))[0])
+                    prediction += torch.flip(temp_pred, axes)
+
             prediction /= (len(axes_combinations) + 1)
         return prediction
 
@@ -641,8 +679,9 @@ class nnUNetPredictor(object):
     def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
             -> Union[np.ndarray, torch.Tensor]:
         assert isinstance(input_image, torch.Tensor)
-        self.network = self.network.to(self.device)
-        self.network.eval()
+        if self.device not in [torch.device('cpu'), 'cpu']:
+            self.network = self.network.to(self.device)
+            self.network.eval()
 
         empty_cache(self.device)
 
