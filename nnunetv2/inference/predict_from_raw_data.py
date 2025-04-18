@@ -9,6 +9,7 @@ from time import sleep
 from typing import Tuple, Union, List, Optional
 
 import numpy as np
+import time
 import torch
 from acvl_utils.cropping_and_padding.padding import pad_nd_image
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
@@ -130,29 +131,30 @@ class nnUNetPredictor(object):
         self.trainer_name = trainer_name
         self.allowed_mirroring_axes = inference_allowed_mirroring_axes
         self.label_manager = plans_manager.get_label_manager(dataset_json)
+        if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
+                and not isinstance(self.network, OptimizedModule):
+            print('Using torch.compile')
+            self.network = torch.compile(self.network)
 
-        ov_model_path = f"{model_training_output_dir}/model.xml"
-        config = {
-            hints.performance_mode: hints.PerformanceMode.LATENCY,
-            hints.enable_cpu_pinning(): True,
-        }
-        core = ov.Core()
-        core.set_property(
-            "CPU",
-            {hints.execution_mode: hints.ExecutionMode.PERFORMANCE},
-        )
-        if not os.path.exists(ov_model_path):
-            input_tensor = torch.randn(
-                1, num_input_channels, *configuration_manager.patch_size,
-                requires_grad=False
-            )
-            ov_model = ov.convert_model(
-                self.network, example_input=input_tensor
+        if self.use_openvino:
+            ov_model_path = f"{model_training_output_dir}/model.xml"
+            config = {
+                hints.performance_mode: hints.PerformanceMode.LATENCY,
+                hints.enable_cpu_pinning(): True,
+            }
+            core = ov.Core()
+            if not os.path.exists(ov_model_path):
+                input_tensor = torch.randn(
+                    1, num_input_channels, *configuration_manager.patch_size,
+                    requires_grad=False
                 )
-            ov.save_model(ov_model, ov_model_path)
+                ov_model = ov.convert_model(
+                    self.network, example_input=input_tensor
+                    )
+                ov.save_model(ov_model, ov_model_path)
 
-        ov_model = core.read_model(ov_model_path)
-        self.network = core.compile_model(ov_model, "CPU", config=config)
+            ov_model = core.read_model(ov_model_path)
+            self.network = core.compile_model(ov_model, "CPU", config=config)
 
 
     def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
@@ -579,10 +581,23 @@ class nnUNetPredictor(object):
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
+
+        start_time = time.time()
         if self.use_openvino:
             prediction = torch.from_numpy(self.network(x)[0])
         else:
             prediction = self.network(x)
+        end_time = time.time()
+
+        if self.use_openvino:
+            print("using openvino: input shape ", x.shape, " , prediction shape ", prediction.shape, " , prediction sum ", prediction.sum())
+            execution_time = end_time - start_time
+            print(f"OpenVINO 代码执行时间: {execution_time:.6f} 秒")
+        else:
+            print("using torch: input shape ", x.shape, " , prediction shape ", prediction.shape, " , prediction sum ", prediction.sum())
+            execution_time = end_time - start_time
+            print(f"Torch 代码执行时间: {execution_time:.6f} 秒")
+
 
         if mirror_axes is not None:
             assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes does not match the dimension of the input!'
